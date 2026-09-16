@@ -1,0 +1,1191 @@
+---
+title: "Analiza decyzji kredytowej z użyciem sieci Bayesowskiej"
+author: "Bartosz Kawalec, Anna Oleszko"
+date: "2026-05-25"
+lang: pl
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6.5
+)
+set.seed(123)
+```
+
+<style>
+body {
+  background-color: #f7f9fb;
+}
+.main-container {
+  max-width: 1180px !important;
+}
+.toc-content {
+  background-color: #ffffff;
+  padding: 30px 48px 60px 48px;
+  border-radius: 12px;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.06);
+}
+#header {
+  border-bottom: 2px solid #e8eef5;
+  margin-bottom: 28px;
+  padding-bottom: 18px;
+}
+h1.title {
+  font-weight: 700;
+  color: #1f3b57;
+}
+h2 {
+  color: #1f3b57;
+  margin-top: 38px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e8eef5;
+}
+h3 {
+  color: #2c577c;
+  margin-top: 28px;
+}
+table {
+  font-size: 14px;
+}
+caption {
+  color: #1f3b57;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+blockquote {
+  border-left: 4px solid #2c7fb8;
+  background: #eef6fb;
+  padding: 12px 18px;
+  color: #24415c;
+}
+.info-box {
+  background: #eef6fb;
+  border-left: 5px solid #2c7fb8;
+  padding: 14px 18px;
+  margin: 18px 0;
+  border-radius: 8px;
+}
+.warning-box {
+  background: #fff7ed;
+  border-left: 5px solid #f59e0b;
+  padding: 14px 18px;
+  margin: 18px 0;
+  border-radius: 8px;
+}
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin: 20px 0 28px 0;
+}
+.metric-card {
+  background: linear-gradient(180deg, #ffffff, #f2f7fb);
+  border: 1px solid #dce8f2;
+  border-radius: 12px;
+  padding: 18px;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+.metric-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #1f3b57;
+}
+.metric-label {
+  font-size: 13px;
+  color: #5e7386;
+  margin-top: 4px;
+}
+.small-note {
+  color: #64748b;
+  font-size: 13px;
+}
+</style>
+
+```{r biblioteki, include=FALSE}
+wymagane_pakiety <- c(
+  "bnlearn", "gRain", "dplyr", "ggplot2",
+  "igraph", "ggraph", "tidygraph", "grid"
+)
+
+brakujace_pakiety <- wymagane_pakiety[
+  !vapply(wymagane_pakiety, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(brakujace_pakiety) > 0) {
+  stop(
+    "Brak wymaganych pakietów: ",
+    paste(brakujace_pakiety, collapse = ", "),
+    ". Zainstaluj je przed renderowaniem raportu."
+  )
+}
+
+library(bnlearn)
+library(gRain)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(grid)
+
+# Funkcje pakietu bnlearn są poniżej wywoływane jawnie jako bnlearn::...
+# ponieważ gRain/gRbase udostępniają funkcje o tych samych nazwach (np. parents()).
+```
+
+# Wprowadzenie
+
+Celem projektu jest zbudowanie i zinterpretowanie **dyskretnej sieci Bayesowskiej** wspierającej analizę decyzji kredytowej. Główne pytanie analityczne brzmi:
+
+> Jak zmienia się warunkowe prawdopodobieństwo pozytywnej lub negatywnej decyzji kredytowej po uwzględnieniu informacji o profilu klienta, jego historii kredytowej i parametrach wniosku?
+
+Zmienną wynikową jest `loan_status`, przyjmująca wartości `Pozytywna` oraz `Odrzucona`. Analiza nie ma na celu zbudowania produkcyjnego systemu scoringowego ani wykazania zależności przyczynowo-skutkowych. Jej celem jest poznanie struktury zależności probabilistycznych w danych oraz demonstracja wnioskowania scenariuszowego.
+
+<div class="info-box">
+Sieć Bayesowska opisuje wspólny rozkład prawdopodobieństwa wielu zmiennych za pomocą grafu skierowanego i warunkowych rozkładów prawdopodobieństwa. Dzięki temu może służyć zarówno do opisu struktury zależności, jak i do odpowiadania na pytania typu „co zmienia się po zaobserwowaniu określonej informacji o kliencie?”.
+</div>
+
+# Cel i zakres projektu
+
+Projekt obejmuje:
+
+1. kontrolę jakości i eksplorację zbioru danych,
+2. identyfikację oraz ograniczenie redundancji między zmiennymi,
+3. przygotowanie danych do dyskretnej sieci Bayesowskiej,
+4. porównanie trzech algorytmów uczenia struktury: Hill-Climbing, Tabu Search oraz MMHC,
+5. ocenę struktur za pomocą BIC,
+6. uzupełniającą walidację krzyżową dla zmiennej `loan_status`,
+7. ocenę stabilności łuków metodą bootstrap,
+8. uczenie parametrów wybranej sieci,
+9. wnioskowanie prognostyczne i diagnostyczne,
+10. interpretację biznesową oraz omówienie ograniczeń.
+
+# Dane
+
+## Źródło danych
+
+Do analizy wykorzystano zbiór `Loan_approval_data_2025.csv`, zawierający 50 000 obserwacji klientów i wniosków kredytowych. Zbiór pochodzi z publicznego repozytorium Kaggle **Realistic Loan Approval Dataset: US and Canada**. Projekt wykorzystuje dane jako materiał analityczny; wyniki odnoszą się do tego konkretnego zbioru i nie powinny być automatycznie generalizowane na rzeczywisty portfel dowolnego banku.
+
+```{r wczytanie-danych, include=FALSE}
+plik_danych <- "Loan_approval_data_2025.csv"
+
+if (!file.exists(plik_danych)) {
+  stop(
+    "Nie znaleziono pliku ", plik_danych,
+    ". Umieść plik CSV w tym samym folderze co dokument Rmd."
+  )
+}
+
+dane <- read.csv(plik_danych, stringsAsFactors = FALSE)
+
+wymagane_kolumny <- c(
+  "customer_id", "age", "occupation_status", "years_employed",
+  "annual_income", "credit_score", "credit_history_years",
+  "savings_assets", "current_debt", "defaults_on_file",
+  "delinquencies_last_2yrs", "derogatory_marks", "product_type",
+  "loan_intent", "loan_amount", "interest_rate",
+  "debt_to_income_ratio", "loan_to_income_ratio",
+  "payment_to_income_ratio", "loan_status"
+)
+
+brakujace_kolumny <- setdiff(wymagane_kolumny, names(dane))
+if (length(brakujace_kolumny) > 0) {
+  stop(
+    "W pliku brakuje wymaganych kolumn: ",
+    paste(brakujace_kolumny, collapse = ", ")
+  )
+}
+```
+
+## Kontrola jakości danych
+
+```{r karty-danych, echo=FALSE, results='asis'}
+cat('<div class="metric-grid">')
+cat(paste0('<div class="metric-card"><div class="metric-value">', nrow(dane), '</div><div class="metric-label">obserwacji</div></div>'))
+cat(paste0('<div class="metric-card"><div class="metric-value">', ncol(dane), '</div><div class="metric-label">zmiennych w pliku źródłowym</div></div>'))
+cat(paste0('<div class="metric-card"><div class="metric-value">', sum(is.na(dane)), '</div><div class="metric-label">braków danych</div></div>'))
+cat('</div>')
+```
+
+```{r kontrola-jakosci, echo=FALSE}
+kontrola_jakosci <- data.frame(
+  Miara = c(
+    "Liczba obserwacji",
+    "Liczba kolumn",
+    "Braki danych",
+    "Duplikaty customer_id",
+    "Duplikaty całych wierszy"
+  ),
+  Wartosc = c(
+    nrow(dane),
+    ncol(dane),
+    sum(is.na(dane)),
+    sum(duplicated(dane$customer_id)),
+    sum(duplicated(dane))
+  )
+)
+
+knitr::kable(
+  kontrola_jakosci,
+  caption = "Kontrola jakości danych wejściowych"
+)
+```
+
+## Charakter i słownik zmiennych
+
+```{r slownik-zmiennych, echo=FALSE}
+slownik_zmiennych <- data.frame(
+  Zmienna = c(
+    "age", "occupation_status", "years_employed", "annual_income",
+    "credit_score", "credit_history_years", "savings_assets",
+    "current_debt", "defaults_on_file", "delinquencies_last_2yrs",
+    "derogatory_marks", "loan_amount", "interest_rate", "loan_intent",
+    "product_type", "debt_to_income_ratio", "loan_to_income_ratio",
+    "payment_to_income_ratio", "loan_status"
+  ),
+  Opis = c(
+    "wiek klienta",
+    "status zawodowy klienta",
+    "liczba lat zatrudnienia",
+    "roczny dochód klienta",
+    "ocena kredytowa klienta",
+    "długość historii kredytowej",
+    "wartość oszczędności i aktywów",
+    "aktualne zadłużenie klienta",
+    "informacja o wcześniejszych niespłaconych zobowiązaniach",
+    "liczba opóźnień w spłacie w ostatnich dwóch latach",
+    "liczba negatywnych wpisów w historii kredytowej",
+    "kwota wnioskowanej pożyczki",
+    "oprocentowanie pożyczki",
+    "cel pożyczki",
+    "typ produktu kredytowego",
+    "relacja aktualnego zadłużenia do dochodu",
+    "relacja kwoty pożyczki do dochodu",
+    "relacja płatności do dochodu",
+    "decyzja kredytowa — zmienna wynikowa"
+  )
+)
+
+knitr::kable(
+  slownik_zmiennych,
+  caption = "Słownik zmiennych w danych źródłowych"
+)
+```
+
+# Wstępna analiza danych
+
+## Rozkład decyzji kredytowej
+
+```{r rozklad-y-przed-przygotowaniem, echo=FALSE}
+rozklad_y_surowy <- dane %>%
+  count(loan_status) %>%
+  mutate(
+    Decyzja = ifelse(loan_status == 1, "Pozytywna", "Odrzucona"),
+    Udzial = n / sum(n)
+  ) %>%
+  select(Decyzja, n, Udzial)
+
+knitr::kable(
+  transform(rozklad_y_surowy, Udzial = round(Udzial, 4)),
+  col.names = c("Decyzja", "Liczba obserwacji", "Udział"),
+  caption = "Rozkład zmiennej wynikowej loan_status"
+)
+```
+
+```{r wykres-rozkladu-y, echo=FALSE, fig.height=4.5, fig.width=7.5}
+ggplot(rozklad_y_surowy, aes(x = Decyzja, y = Udzial)) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = paste0(round(Udzial * 100, 1), "%")),
+    vjust = -0.4
+  ) +
+  ylim(0, 1) +
+  labs(
+    title = "Rozkład decyzji kredytowej w danych",
+    x = "Decyzja kredytowa",
+    y = "Udział"
+  ) +
+  theme_minimal()
+```
+
+## Szczególna zależność: `defaults_on_file`
+
+Przed uczeniem modelu warto sprawdzić proste zależności, które mogą silnie wpływać na wynik. Poniższa tabela pokazuje relację między wcześniejszym defaultem a decyzją kredytową.
+
+```{r analiza-defaultow, echo=FALSE}
+tabela_defaultow <- dane %>%
+  mutate(
+    defaults_on_file = ifelse(defaults_on_file == 1, "Tak", "Nie"),
+    loan_status = ifelse(loan_status == 1, "Pozytywna", "Odrzucona")
+  ) %>%
+  count(defaults_on_file, loan_status) %>%
+  group_by(defaults_on_file) %>%
+  mutate(Udzial_w_grupie = n / sum(n)) %>%
+  ungroup()
+
+knitr::kable(
+  transform(tabela_defaultow, Udzial_w_grupie = round(Udzial_w_grupie, 4)),
+  col.names = c("Default w historii", "Decyzja", "Liczba", "Udział w grupie"),
+  caption = "Decyzja kredytowa a defaults_on_file"
+)
+```
+
+```{r tekst-defaultow, echo=FALSE, results='asis'}
+n_default <- sum(dane$defaults_on_file == 1)
+n_default_pozytywna <- sum(dane$defaults_on_file == 1 & dane$loan_status == 1)
+
+cat('<div class="warning-box">')
+cat(
+  paste0(
+    "W analizowanym zbiorze znajduje się <strong>", n_default,
+    "</strong> obserwacji z <code>defaults_on_file = 1</code>. ",
+    "Liczba pozytywnych decyzji w tej grupie wynosi <strong>",
+    n_default_pozytywna,
+    "</strong>. Jest to właściwość tego zbioru danych, a nie uniwersalna reguła kredytowa; ",
+    "należy ją uwzględnić przy interpretacji struktury sieci i wyników wnioskowania."
+  )
+)
+cat('</div>')
+```
+
+# Redundancja i wybór cech do modelu
+
+W danych występują zmienne pochodne, które są prawie deterministycznie związane z innymi kolumnami. W sieci Bayesowskiej takie relacje mogą powodować, że algorytm uczy się przede wszystkim wzorów matematycznych użytych do konstrukcji wskaźników zamiast bardziej interesujących zależności między cechami.
+
+```{r diagnoza-redundancji, echo=FALSE}
+bezpieczne_dzielenie <- function(a, b) {
+  ifelse(b == 0, NA_real_, a / b)
+}
+
+redundancja <- data.frame(
+  Relacja = c(
+    "debt_to_income_ratio ≈ current_debt / annual_income",
+    "loan_to_income_ratio ≈ loan_amount / annual_income",
+    "payment_to_income_ratio ≈ loan_to_income_ratio / 3"
+  ),
+  Maksymalny_blad_bezwzgledny = c(
+    max(abs(
+      dane$debt_to_income_ratio -
+        bezpieczne_dzielenie(dane$current_debt, dane$annual_income)
+    ), na.rm = TRUE),
+    max(abs(
+      dane$loan_to_income_ratio -
+        bezpieczne_dzielenie(dane$loan_amount, dane$annual_income)
+    ), na.rm = TRUE),
+    max(abs(
+      dane$payment_to_income_ratio -
+        dane$loan_to_income_ratio / 3
+    ), na.rm = TRUE)
+  )
+)
+
+knitr::kable(
+  transform(
+    redundancja,
+    Maksymalny_blad_bezwzgledny = round(Maksymalny_blad_bezwzgledny, 6)
+  ),
+  caption = "Kontrola prawie deterministycznych zależności między zmiennymi"
+)
+```
+
+W modelu zachowano `debt_to_income_ratio`, ponieważ jest czytelną biznesowo miarą obciążenia dochodu zadłużeniem. Jednocześnie usunięto `current_debt`, aby nie przechowywać jednocześnie wskaźnika i jego obu składników. Usunięto również `loan_to_income_ratio` oraz `payment_to_income_ratio`; pierwszy jest bezpośrednio wyliczany z `loan_amount` i `annual_income`, a drugi jest niemal liniową transformacją `loan_to_income_ratio`.
+
+<div class="info-box">
+Ta decyzja nie oznacza, że usunięte zmienne są biznesowo nieistotne. Jej celem jest ograniczenie redundancji i ułatwienie interpretacji struktury sieci.
+</div>
+
+# Przygotowanie danych
+
+```{r przygotowanie-danych}
+dane_bn <- dane %>%
+  select(
+    -customer_id,
+    -current_debt,
+    -loan_to_income_ratio,
+    -payment_to_income_ratio
+  ) %>%
+  mutate(
+    loan_status = factor(
+      loan_status,
+      levels = c(0, 1),
+      labels = c("Odrzucona", "Pozytywna")
+    ),
+    defaults_on_file = factor(
+      defaults_on_file,
+      levels = c(0, 1),
+      labels = c("Nie", "Tak")
+    ),
+    occupation_status = as.factor(occupation_status),
+    product_type = as.factor(product_type),
+    loan_intent = as.factor(loan_intent)
+  )
+```
+
+## Dyskretyzacja zmiennych liczbowych
+
+W projekcie zastosowano **dyskretną** sieć Bayesowską, dlatego zmienne ciągłe i liczbowe zostały przekształcone do poziomów jakościowych. Dla zmiennych o większej liczbie różnych wartości zastosowano podział kwantylowy na trzy grupy (`niski`, `sredni`, `wysoki`). Dla zmiennych o niewielkiej liczbie unikalnych wartości zachowano wartości obserwowane jako osobne poziomy faktora.
+
+```{r dyskretyzacja}
+zmienne_numeryczne <- c(
+  "age",
+  "years_employed",
+  "annual_income",
+  "credit_score",
+  "credit_history_years",
+  "savings_assets",
+  "delinquencies_last_2yrs",
+  "derogatory_marks",
+  "loan_amount",
+  "interest_rate",
+  "debt_to_income_ratio"
+)
+
+dyskretyzuj <- function(x, prog_malo_wartosci = 10) {
+  x_bez_na <- x[!is.na(x)]
+  liczba_unikalnych <- length(unique(x_bez_na))
+
+  if (liczba_unikalnych <= prog_malo_wartosci) {
+    return(as.factor(x))
+  }
+
+  granice <- unique(as.numeric(quantile(
+    x,
+    probs = c(0, 1/3, 2/3, 1),
+    na.rm = TRUE,
+    type = 7
+  )))
+
+  liczba_przedzialow <- length(granice) - 1
+
+  if (liczba_przedzialow < 2) {
+    return(as.factor(x))
+  }
+
+  etykiety <- switch(
+    as.character(liczba_przedzialow),
+    "2" = c("niski", "wysoki"),
+    "3" = c("niski", "sredni", "wysoki"),
+    paste0("poziom_", seq_len(liczba_przedzialow))
+  )
+
+  cut(
+    x,
+    breaks = granice,
+    include.lowest = TRUE,
+    labels = etykiety,
+    ordered_result = TRUE
+  )
+}
+
+dane_bn <- dane_bn %>%
+  mutate(across(all_of(zmienne_numeryczne), dyskretyzuj))
+
+dane_bn[] <- lapply(dane_bn, as.factor)
+```
+
+```{r kontrola-przygotowania, echo=FALSE}
+problemowe <- names(dane_bn)[!vapply(dane_bn, is.factor, logical(1))]
+stopifnot(length(problemowe) == 0)
+
+tabela_poziomow <- data.frame(
+  Zmienna = names(dane_bn),
+  Liczba_poziomow = vapply(dane_bn, nlevels, integer(1)),
+  Poziomy = vapply(
+    dane_bn,
+    function(x) paste(levels(x), collapse = ", "),
+    character(1)
+  ),
+  row.names = NULL
+)
+
+knitr::kable(
+  tabela_poziomow,
+  caption = "Liczba i nazwy poziomów zmiennych po przygotowaniu danych"
+)
+```
+
+# Uczenie struktury sieci Bayesowskiej
+
+## Założenia strukturalne
+
+`loan_status` jest w projekcie traktowana jako zmienna wynikowa. Zastosowano więc blacklistę blokującą łuki **wychodzące** z `loan_status`. Jest to założenie modelowe służące interpretacji i wnioskowaniu prognostycznemu — nie oznacza ono, że kierunki łuków dowodzą przyczynowości.
+
+Dla modeli score-based ograniczono maksymalną liczbę rodziców pojedynczego węzła do 3. To samo ograniczenie przekazano do fazy maksymalizacji MMHC, aby porównanie metod było bardziej spójne.
+
+```{r uczenie-struktur}
+blacklist <- data.frame(
+  from = "loan_status",
+  to = setdiff(names(dane_bn), "loan_status")
+)
+
+set.seed(123)
+
+model_hc <- bnlearn::hc(
+  dane_bn,
+  score = "bic",
+  blacklist = blacklist,
+  maxp = 3
+)
+
+model_tabu <- bnlearn::tabu(
+  dane_bn,
+  score = "bic",
+  blacklist = blacklist,
+  maxp = 3
+)
+
+model_mmhc <- bnlearn::mmhc(
+  dane_bn,
+  blacklist = blacklist,
+  maximize.args = list(
+    score = "bic",
+    maxp = 3
+  )
+)
+```
+
+# Porównanie modeli
+
+## Kryterium BIC
+
+BIC służy tu do porównania struktur wyuczonych na tym samym zbiorze danych. W implementacji `bnlearn` większa wartość score BIC oznacza korzystniejszy kompromis między dopasowaniem a złożonością modelu.
+
+```{r porownanie-bic}
+score_hc <- bnlearn::score(model_hc, dane_bn, type = "bic")
+score_tabu <- bnlearn::score(model_tabu, dane_bn, type = "bic")
+score_mmhc <- bnlearn::score(model_mmhc, dane_bn, type = "bic")
+
+porownanie_modeli <- data.frame(
+  Model = c("Hill-Climbing", "Tabu Search", "MMHC"),
+  BIC_surowe = c(score_hc, score_tabu, score_mmhc),
+  stringsAsFactors = FALSE
+)
+
+porownanie_modeli$BIC <- round(porownanie_modeli$BIC_surowe, 2)
+
+knitr::kable(
+  porownanie_modeli[, c("Model", "BIC")],
+  caption = "Porównanie struktur za pomocą BIC"
+)
+```
+
+## Uzupełniająca walidacja krzyżowa
+
+BIC nie jest walidacją poza próbą. Dlatego dodatkowo wykonano 5-fold cross-validation, w której w każdym foldzie struktura jest uczona ponownie, a następnie oceniana jest klasyfikacja `loan_status`. Jako miarę podano błąd klasyfikacji oraz odpowiadającą mu trafność (`1 - błąd`).
+
+Walidacja dotyczy przygotowanego już, zdyskretyzowanego zbioru. Nie jest to pełna walidacja produkcyjnego pipeline'u, ponieważ progi dyskretyzacji zostały ustalone przed podziałem na foldy.
+
+```{r walidacja-krzyzowa}
+args_hc <- list(
+  score = "bic",
+  blacklist = blacklist,
+  maxp = 3
+)
+
+args_tabu <- list(
+  score = "bic",
+  blacklist = blacklist,
+  maxp = 3
+)
+
+args_mmhc <- list(
+  blacklist = blacklist,
+  maximize.args = list(
+    score = "bic",
+    maxp = 3
+  )
+)
+
+set.seed(123)
+
+cv_hc <- bnlearn::bn.cv(
+  dane_bn,
+  bn = "hc",
+  loss = "pred",
+  algorithm.args = args_hc,
+  loss.args = list(
+    target = "loan_status",
+    predict = "parents"
+  ),
+  fit = "bayes",
+  method = "k-fold",
+  k = 5,
+  runs = 1
+)
+
+cv_tabu <- bnlearn::bn.cv(
+  dane_bn,
+  bn = "tabu",
+  loss = "pred",
+  algorithm.args = args_tabu,
+  loss.args = list(
+    target = "loan_status",
+    predict = "parents"
+  ),
+  fit = "bayes",
+  method = "k-fold",
+  k = 5,
+  runs = 1
+)
+
+cv_mmhc <- bnlearn::bn.cv(
+  dane_bn,
+  bn = "mmhc",
+  loss = "pred",
+  algorithm.args = args_mmhc,
+  loss.args = list(
+    target = "loan_status",
+    predict = "parents"
+  ),
+  fit = "bayes",
+  method = "k-fold",
+  k = 5,
+  runs = 1
+)
+
+bledy_cv <- c(
+  as.numeric(bnlearn::loss(cv_hc))[1],
+  as.numeric(bnlearn::loss(cv_tabu))[1],
+  as.numeric(bnlearn::loss(cv_mmhc))[1]
+)
+
+walidacja_modeli <- data.frame(
+  Model = c("Hill-Climbing", "Tabu Search", "MMHC"),
+  Blad_klasyfikacji_CV = bledy_cv,
+  Trafnosc_CV = 1 - bledy_cv,
+  stringsAsFactors = FALSE
+)
+
+baseline_accuracy <- max(prop.table(table(dane_bn$loan_status)))
+
+knitr::kable(
+  transform(
+    walidacja_modeli,
+    Blad_klasyfikacji_CV = round(Blad_klasyfikacji_CV, 4),
+    Trafnosc_CV = round(Trafnosc_CV, 4)
+  ),
+  caption = "5-fold cross-validation dla loan_status"
+)
+```
+
+```{r baseline-info, echo=FALSE, results='asis'}
+cat('<div class="info-box">')
+cat(
+  paste0(
+    "Trafność prostego klasyfikatora większościowego wynosi ",
+    round(baseline_accuracy * 100, 1),
+    "%. Wyniki CV warto interpretować również względem tego punktu odniesienia."
+  )
+)
+cat('</div>')
+```
+
+## Wybór algorytmu do dalszej analizy
+
+Podstawowym kryterium wyboru pozostaje BIC, ponieważ celem projektu jest analiza struktury zależności, a nie wyłącznie klasyfikacja. Jeżeli kilka metod uzyskuje praktycznie identyczny najwyższy BIC, remis rozstrzygany jest niższym błędem klasyfikacji w cross-validation.
+
+```{r wybor-modelu, echo=FALSE}
+porownanie_pelne <- porownanie_modeli %>%
+  left_join(walidacja_modeli, by = "Model")
+
+najwyzszy_bic <- max(porownanie_pelne$BIC_surowe)
+kandydaci <- porownanie_pelne %>%
+  filter(abs(BIC_surowe - najwyzszy_bic) < 1e-8)
+
+if (nrow(kandydaci) > 1) {
+  kandydaci <- kandydaci %>%
+    arrange(Blad_klasyfikacji_CV, Model)
+}
+
+najlepszy_model_nazwa <- kandydaci$Model[1]
+
+najlepszy_model <- switch(
+  najlepszy_model_nazwa,
+  "Hill-Climbing" = model_hc,
+  "Tabu Search" = model_tabu,
+  "MMHC" = model_mmhc
+)
+
+algorytm_bn <- switch(
+  najlepszy_model_nazwa,
+  "Hill-Climbing" = "hc",
+  "Tabu Search" = "tabu",
+  "MMHC" = "mmhc"
+)
+
+algorytm_args <- switch(
+  algorytm_bn,
+  "hc" = args_hc,
+  "tabu" = args_tabu,
+  "mmhc" = args_mmhc
+)
+
+wybrany_wiersz <- porownanie_pelne %>%
+  filter(Model == najlepszy_model_nazwa) %>%
+  slice(1)
+
+tekst_wyboru_modelu <- if (nrow(kandydaci) > 1) {
+  paste0(
+    "Najwyższą wartość BIC uzyskało kilka struktur. ",
+    "Po uwzględnieniu niższego błędu klasyfikacji w 5-fold CV ",
+    "do dalszej analizy wybrano model ", najlepszy_model_nazwa, "."
+  )
+} else {
+  paste0(
+    "Do dalszej analizy wybrano model ", najlepszy_model_nazwa,
+    ", ponieważ uzyskał najwyższą wartość BIC. ",
+    "Jego uzupełniająca trafność w 5-fold CV wyniosła ",
+    round(100 * wybrany_wiersz$Trafnosc_CV, 1), "%."
+  )
+}
+```
+
+```{r wybor-modelu-komentarz, echo=FALSE, results='asis'}
+cat('<div class="info-box">')
+cat(tekst_wyboru_modelu)
+cat('</div>')
+```
+
+# Stabilność struktury: bootstrap
+
+Pojedyncza wyuczona sieć może zależeć od konkretnej próby danych. Dlatego przeprowadzono dodatkową analizę bootstrapową. W każdej replice algorytm ponownie uczy strukturę na losowej próbie, a siła łuku oznacza częstość jego występowania w uzyskanych sieciach.
+
+Ze względu na koszt obliczeniowy wykorzystano 50 replik bootstrapowych, każda o rozmiarze maksymalnie 10 000 obserwacji. Jest to analiza stabilności, a nie pełna procedura niepewności statystycznej dla każdego parametru.
+
+```{r bootstrap-struktury}
+set.seed(123)
+
+liczba_bootstrap <- 50
+rozmiar_bootstrap <- min(10000, nrow(dane_bn))
+
+stabilnosc_lukow <- bnlearn::boot.strength(
+  data = dane_bn,
+  R = liczba_bootstrap,
+  m = rozmiar_bootstrap,
+  algorithm = algorytm_bn,
+  algorithm.args = algorytm_args,
+  cpdag = FALSE
+)
+
+prog_stabilnosci <- bnlearn::inclusion.threshold(stabilnosc_lukow)
+
+najsilniejsze_luki <- as.data.frame(stabilnosc_lukow) %>%
+  arrange(desc(strength), desc(direction)) %>%
+  head(15)
+
+knitr::kable(
+  transform(
+    najsilniejsze_luki,
+    strength = round(strength, 3),
+    direction = round(direction, 3)
+  ),
+  col.names = c("Od", "Do", "Siła", "Prawdopodobieństwo kierunku"),
+  caption = "Najstabilniejsze łuki w analizie bootstrapowej"
+)
+```
+
+```{r stabilnosc-loan-status, echo=FALSE}
+stabilnosc_loan <- as.data.frame(stabilnosc_lukow) %>%
+  filter(to == "loan_status") %>%
+  arrange(desc(strength), desc(direction))
+
+if (nrow(stabilnosc_loan) > 0) {
+  knitr::kable(
+    transform(
+      stabilnosc_loan,
+      strength = round(strength, 3),
+      direction = round(direction, 3)
+    ),
+    col.names = c("Od", "Do", "Siła", "Prawdopodobieństwo kierunku"),
+    caption = "Stabilność łuków prowadzących do loan_status"
+  )
+} else {
+  cat("W replikach bootstrapowych nie znaleziono powtarzalnych łuków prowadzących bezpośrednio do loan_status.")
+}
+```
+
+```{r komentarz-bootstrap, echo=FALSE, results='asis'}
+cat('<div class="info-box">')
+cat(
+  paste0(
+    "Automatycznie wyznaczony próg włączenia łuku na podstawie bootstrapu wynosi ",
+    round(prog_stabilnosci, 3),
+    ". Łuki o sile powyżej tego poziomu można traktować jako bardziej stabilne względem zmian próby. ",
+    "Kierunek nadal nie powinien być interpretowany jako dowód przyczynowości."
+  )
+)
+cat('</div>')
+```
+
+# Wizualizacja i charakterystyka wybranej sieci
+
+```{r charakterystyka-sieci, echo=FALSE}
+liczba_lukow <- bnlearn::narcs(najlepszy_model)
+liczba_wezlow <- length(bnlearn::nodes(najlepszy_model))
+
+charakterystyka_sieci <- data.frame(
+  Model = najlepszy_model_nazwa,
+  Liczba_wezlow = liczba_wezlow,
+  Liczba_lukow = liczba_lukow,
+  BIC = round(bnlearn::score(najlepszy_model, dane_bn, type = "bic"), 2)
+)
+
+knitr::kable(
+  charakterystyka_sieci,
+  caption = "Charakterystyka wybranej sieci Bayesowskiej"
+)
+```
+
+## Wykres struktury sieci
+
+```{r wizualizacja-sieci, echo=FALSE, fig.height=8, fig.width=11}
+luki <- bnlearn::arcs(najlepszy_model)
+
+graf <- graph_from_data_frame(
+  luki,
+  directed = TRUE,
+  vertices = data.frame(name = bnlearn::nodes(najlepszy_model))
+)
+
+set.seed(123)
+ggraph(graf, layout = "fr") +
+  geom_edge_link(
+    arrow = arrow(length = unit(3, "mm")),
+    end_cap = circle(3, "mm"),
+    alpha = 0.55
+  ) +
+  geom_node_point(size = 5) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE,
+    size = 3
+  ) +
+  theme_void() +
+  ggtitle(paste("Struktura sieci Bayesowskiej —", najlepszy_model_nazwa))
+```
+
+## Bezpośrednie otoczenie `loan_status`
+
+```{r rodzice-loan-status, echo=FALSE}
+rodzice_loan_status_vec <- bnlearn::parents(najlepszy_model, "loan_status")
+
+if (length(rodzice_loan_status_vec) > 0) {
+  rodzice_loan_status <- data.frame(
+    Zmienna_wynikowa = "loan_status",
+    Rodzic = rodzice_loan_status_vec
+  )
+
+  knitr::kable(
+    rodzice_loan_status,
+    caption = "Bezpośredni rodzice zmiennej loan_status"
+  )
+} else {
+  cat("Wybrana struktura nie zawiera bezpośrednich rodziców zmiennej loan_status.")
+}
+```
+
+```{r tabela-lukow, include=FALSE}
+luki_tabela <- as.data.frame(bnlearn::arcs(najlepszy_model))
+colnames(luki_tabela) <- c("Od", "Do")
+```
+
+# Uczenie parametrów
+
+Po ustaleniu struktury przeprowadzono uczenie parametrów metodą bayesowską. Dla każdej zmiennej dyskretnej estymowane są warunkowe tabele prawdopodobieństwa (CPT).
+
+```{r uczenie-parametrow}
+model_fit <- bnlearn::bn.fit(
+  najlepszy_model,
+  data = dane_bn,
+  method = "bayes"
+)
+```
+
+## CPT dla `loan_status`
+
+```{r tabela-parametrow-loan-status, echo=FALSE}
+cpt_loan_status <- as.data.frame.table(model_fit$loan_status$prob)
+colnames(cpt_loan_status)[ncol(cpt_loan_status)] <- "Prawdopodobienstwo"
+cpt_loan_status$Prawdopodobienstwo <- round(
+  cpt_loan_status$Prawdopodobienstwo,
+  4
+)
+
+knitr::kable(
+  cpt_loan_status,
+  caption = "Warunkowa tabela prawdopodobieństw dla loan_status"
+)
+```
+
+## Dodatkowa CPT dla zmiennej istotnej interpretacyjnie
+
+Zamiast zakładać z góry, że konkretny węzeł jest rodzicem `loan_status`, zmienna do dodatkowej prezentacji CPT jest wybierana dynamicznie. Jeżeli `credit_score` jest bezpośrednim rodzicem decyzji, wykorzystywana jest ta zmienna; w przeciwnym razie pokazywany jest pierwszy dostępny rodzic `loan_status`.
+
+```{r dodatkowa-cpt, echo=FALSE}
+zmienna_cpt_dodatkowa <- if ("credit_score" %in% rodzice_loan_status_vec) {
+  "credit_score"
+} else if (length(rodzice_loan_status_vec) > 0) {
+  rodzice_loan_status_vec[1]
+} else {
+  "credit_score"
+}
+
+cpt_dodatkowa <- as.data.frame.table(
+  model_fit[[zmienna_cpt_dodatkowa]]$prob
+)
+colnames(cpt_dodatkowa)[ncol(cpt_dodatkowa)] <- "Prawdopodobienstwo"
+cpt_dodatkowa$Prawdopodobienstwo <- round(
+  cpt_dodatkowa$Prawdopodobienstwo,
+  4
+)
+
+knitr::kable(
+  cpt_dodatkowa,
+  caption = paste(
+    "Tabela prawdopodobieństw dla",
+    zmienna_cpt_dodatkowa
+  )
+)
+```
+
+# Wnioskowanie probabilistyczne
+
+Przeprowadzono cztery scenariusze. Pierwszy pokazuje rozkład decyzji bez dodatkowej informacji. Kolejne pokazują, jak zmienia się rozkład `loan_status` po uwzględnieniu różnych zestawów informacji o kliencie.
+
+```{r przygotowanie-grain, include=FALSE}
+grain_model <- as.grain(model_fit)
+grain_model <- compile(grain_model)
+```
+
+```{r wnioskowanie, include=FALSE}
+wnioskowanie_1 <- querygrain(
+  grain_model,
+  nodes = "loan_status"
+)
+
+evidence_2 <- setEvidence(
+  grain_model,
+  nodes = c("credit_score", "defaults_on_file", "debt_to_income_ratio"),
+  states = c("wysoki", "Nie", "niski")
+)
+
+wnioskowanie_2 <- querygrain(
+  evidence_2,
+  nodes = "loan_status"
+)
+
+evidence_3 <- setEvidence(
+  grain_model,
+  nodes = c("credit_score", "defaults_on_file", "debt_to_income_ratio"),
+  states = c("sredni", "Nie", "wysoki")
+)
+
+wnioskowanie_3 <- querygrain(
+  evidence_3,
+  nodes = "loan_status"
+)
+
+evidence_4 <- setEvidence(
+  grain_model,
+  nodes = "defaults_on_file",
+  states = "Tak"
+)
+
+wnioskowanie_4 <- querygrain(
+  evidence_4,
+  nodes = "loan_status"
+)
+
+wyniki_wnioskowania <- data.frame(
+  Scenariusz = c(
+    "Brak dodatkowych informacji",
+    "Wysoki credit score, brak defaultów, niski DTI",
+    "Średni credit score, brak defaultów, wysoki DTI",
+    "Default w historii"
+  ),
+  Prawdopodobienstwo_odrzucenia = c(
+    wnioskowanie_1$loan_status["Odrzucona"],
+    wnioskowanie_2$loan_status["Odrzucona"],
+    wnioskowanie_3$loan_status["Odrzucona"],
+    wnioskowanie_4$loan_status["Odrzucona"]
+  ),
+  Prawdopodobienstwo_pozytywnej_decyzji = c(
+    wnioskowanie_1$loan_status["Pozytywna"],
+    wnioskowanie_2$loan_status["Pozytywna"],
+    wnioskowanie_3$loan_status["Pozytywna"],
+    wnioskowanie_4$loan_status["Pozytywna"]
+  )
+)
+
+wyniki_wnioskowania <- wyniki_wnioskowania %>%
+  mutate(
+    Prawdopodobienstwo_odrzucenia =
+      round(Prawdopodobienstwo_odrzucenia, 4),
+    Prawdopodobienstwo_pozytywnej_decyzji =
+      round(Prawdopodobienstwo_pozytywnej_decyzji, 4)
+  )
+```
+
+```{r tabela-wnioskowania, echo=FALSE}
+knitr::kable(
+  wyniki_wnioskowania,
+  caption = "Wyniki wnioskowania prognostycznego"
+)
+```
+
+## Wnioskowanie diagnostyczne
+
+Wnioskowanie diagnostyczne odwraca pytanie: zamiast pytać o decyzję przy znanych cechach klienta, zakładamy znany wynik i sprawdzamy prawdopodobieństwo określonego profilu.
+
+```{r wnioskowanie-diagnostyczne, include=FALSE}
+evidence_diag <- setEvidence(
+  grain_model,
+  nodes = "loan_status",
+  states = "Pozytywna"
+)
+
+wnioskowanie_diag_joint <- querygrain(
+  evidence_diag,
+  nodes = c("credit_score", "debt_to_income_ratio"),
+  type = "joint"
+)
+
+p_wysoki_credit_niski_dti <- wnioskowanie_diag_joint["wysoki", "niski"]
+
+wyniki_diagnostyczne <- data.frame(
+  Pytanie = "P(wysoki credit_score i niski DTI | loan_status = Pozytywna)",
+  Prawdopodobienstwo = round(
+    as.numeric(p_wysoki_credit_niski_dti),
+    4
+  )
+)
+```
+
+```{r tabela-diagnostyczna, echo=FALSE}
+knitr::kable(
+  wyniki_diagnostyczne,
+  caption = "Wynik wnioskowania diagnostycznego"
+)
+```
+
+## Porównanie scenariuszy
+
+```{r wykres-wnioskowania, echo=FALSE, fig.height=5.5, fig.width=10}
+ggplot(
+  wyniki_wnioskowania,
+  aes(
+    x = reorder(Scenariusz, Prawdopodobienstwo_pozytywnej_decyzji),
+    y = Prawdopodobienstwo_pozytywnej_decyzji
+  )
+) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = paste0(
+      round(Prawdopodobienstwo_pozytywnej_decyzji * 100, 1),
+      "%"
+    )),
+    hjust = -0.1
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Prawdopodobieństwo pozytywnej decyzji kredytowej",
+    subtitle = "Wyniki warunkowe dla wybranych scenariuszy",
+    x = NULL,
+    y = "Prawdopodobieństwo"
+  ) +
+  theme_minimal()
+```
+
+# Interpretacja wyników
+
+```{r interpretacja-dynamiczna, echo=FALSE, results='asis'}
+p_bazowe <- wyniki_wnioskowania$Prawdopodobienstwo_pozytywnej_decyzji[1]
+p_dobry <- wyniki_wnioskowania$Prawdopodobienstwo_pozytywnej_decyzji[2]
+p_ryzyko <- wyniki_wnioskowania$Prawdopodobienstwo_pozytywnej_decyzji[3]
+p_default <- wyniki_wnioskowania$Prawdopodobienstwo_pozytywnej_decyzji[4]
+
+cat(
+  paste0(
+    "<p>W scenariuszu bazowym model przypisuje pozytywnej decyzji prawdopodobieństwo <strong>",
+    round(100 * p_bazowe, 1),
+    "%</strong>. Po uwzględnieniu wysokiego <code>credit_score</code>, braku defaultów i niskiego DTI wartość ta wynosi <strong>",
+    round(100 * p_dobry, 1),
+    "%</strong>, natomiast dla średniego <code>credit_score</code>, braku defaultów i wysokiego DTI wynosi <strong>",
+    round(100 * p_ryzyko, 1),
+    "%</strong>.</p>"
+  )
+)
+
+cat(
+  paste0(
+    "<p>Po ustawieniu <code>defaults_on_file = Tak</code> warunkowe prawdopodobieństwo pozytywnej decyzji wynosi <strong>",
+    round(100 * p_default, 1),
+    "%</strong>. Wynik należy odczytywać razem z wcześniejszą analizą danych, w której dla tej grupy nie występowały pozytywne decyzje. Estymacja bayesowska może jednak przypisać zdarzeniom niewidzianym w próbie małe niezerowe prawdopodobieństwo.</p>"
+  )
+)
+```
+
+Różnice między scenariuszami opisują **zmianę warunkowego rozkładu w nauczonej sieci**. Nie są oszacowaniem efektu przyczynowego. Stwierdzenia typu „zmiana DTI powoduje zmianę decyzji” byłyby na podstawie tego projektu zbyt silne; właściwa interpretacja dotyczy współwystępowania informacji i warunkowych prawdopodobieństw.
+
+# Interpretacja biznesowa
+
+Z punktu widzenia analizy ryzyka sieć Bayesowska może wspierać:
+
+- analizę scenariuszy dla różnych profili klientów,
+- identyfikację zmiennych znajdujących się najbliżej `loan_status` w nauczonej strukturze,
+- prezentację warunkowych prawdopodobieństw w bardziej przejrzystej formie niż pojedynczy wynik scoringowy,
+- diagnostyczne pytania odwrotne, np. jakie profile klientów częściej występują w grupie pozytywnych decyzji.
+
+Największą wartością projektu nie jest samo przewidywanie decyzji, lecz możliwość łączenia **struktury zależności** z **wnioskowaniem probabilistycznym**. W praktycznym środowisku bankowym taki model wymagałby jednak niezależnej walidacji, kontroli jakości danych, oceny zgodności regulacyjnej i monitoringu stabilności.
+
+# Ograniczenia
+
+1. **Brak interpretacji przyczynowej.** Kierunki łuków są częściowo wynikiem algorytmu, a częściowo przyjętej blacklisty; nie stanowią dowodu przyczynowości.
+2. **Dyskretyzacja traci informację.** Zamiana zmiennych ciągłych na kilka kategorii ułatwia budowę dyskretnej sieci, ale upraszcza dane.
+3. **Walidacja nie obejmuje całego pipeline'u preprocessingowego.** Progi dyskretyzacji zostały ustalone przed 5-fold CV, więc wynik CV jest uzupełniającą oceną modelu, a nie produkcyjną estymacją jakości na całkowicie nowych danych.
+4. **Silne wzorce specyficzne dla zbioru.** W danych `defaults_on_file = 1` nie współwystępuje z pozytywną decyzją. Taka zależność może silnie wpływać na strukturę i nie musi odzwierciedlać reguły rzeczywistego banku.
+5. **Zmienne pochodne.** W źródłowym zbiorze występują prawie deterministyczne relacje między częścią wskaźników; dlatego część kolumn celowo usunięto.
+6. **Stabilność struktury jest szacowana, a nie gwarantowana.** Bootstrap pokazuje częstość występowania łuków w próbach, ale nie rozwiązuje wszystkich problemów identyfikacji struktury.
+7. **Projekt nie jest systemem scoringowym.** Nie analizowano kalibracji prawdopodobieństw, kosztów błędów decyzyjnych, fairness, driftu ani wymogów regulacyjnych wymaganych w zastosowaniu produkcyjnym.
+
+# Wnioski końcowe
+
+W projekcie zbudowano dyskretną sieć Bayesowską do analizy decyzji kredytowych na zbiorze 50 000 obserwacji. Przed uczeniem struktury wykonano kontrolę jakości danych oraz przeanalizowano redundancję cech. Z modelu usunięto zmienne niemal deterministycznie powiązane z innymi kolumnami, aby ograniczyć ryzyko interpretowania relacji matematycznych jako niezależnych zależności między cechami.
+
+Porównano algorytmy Hill-Climbing, Tabu Search i MMHC przy bardziej spójnych ograniczeniach strukturalnych. Do dalszej analizy wybrano **`r najlepszy_model_nazwa`**. Wybrana struktura zawiera **`r liczba_wezlow` węzłów** i **`r liczba_lukow` łuków**.
+
+Uzupełniająca walidacja krzyżowa dla wybranego algorytmu dała trafność **`r round(100 * wybrany_wiersz$Trafnosc_CV, 1)`%**, przy trafności klasyfikatora większościowego wynoszącej **`r round(100 * baseline_accuracy, 1)`%**. Wynik ten jest pomocniczą miarą jakości, a nie podstawą do traktowania sieci jako gotowego systemu decyzyjnego.
+
+Analiza bootstrapowa pokazała, które łuki są stabilniejsze względem zmian próby. Dzięki temu interpretacja sieci nie opiera się wyłącznie na jednej strukturze wyuczonej z pełnego zbioru.
+
+Wnioskowanie probabilistyczne pozwoliło następnie porównać scenariusze klientów oraz przeprowadzić pytanie diagnostyczne przy znanej pozytywnej decyzji. Wyniki należy interpretować jako warunkowe zależności występujące w analizowanym zbiorze, a nie jako efekty przyczynowe.
+
+Całość pokazuje zastosowanie sieci Bayesowskiej nie tylko jako modelu graficznego, lecz jako narzędzia łączącego eksplorację danych, uczenie struktury, ocenę stabilności, walidację oraz wnioskowanie probabilistyczne.
+
+
+# Bibliografia
+
+1. Scutari, M. — dokumentacja pakietu `bnlearn`, wykorzystywanego do uczenia struktury i parametrów sieci Bayesowskich.
+2. Højsgaard, S. — dokumentacja pakietu `gRain`, wykorzystywanego do wnioskowania probabilistycznego w sieciach Bayesowskich.
+3. R Core Team — dokumentacja środowiska R, wykorzystywanego do przygotowania danych, analizy i wizualizacji.
+4. Wickham, H. i współautorzy — dokumentacja pakietów `dplyr` oraz `ggplot2`, wykorzystanych do transformacji danych i przygotowania wykresów.
+5. Zbiór danych `Loan_approval_data_2025.csv`, wykorzystany jako źródło danych empirycznych w projekcie. Źródło: https://www.kaggle.com/datasets/parthpatel2130/realistic-loan-approval-dataset-us-and-canada.
+
